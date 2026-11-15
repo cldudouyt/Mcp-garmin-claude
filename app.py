@@ -1,14 +1,23 @@
-"""MCP distant : lecture avec la clé API personnelle Garmin de chaque requête,
-publication de séances avec le jeton de publication fourni par la page /connexion.
+"""MCP distant Garmin : lecture des activités et publication de séances.
 
-Le serveur ne conserve rien : la clé et le jeton voyagent dans les en-têtes du connecteur Claude.
+Deux façons de se connecter depuis Claude :
+- OAuth : Claude ouvre la page /connexion, la personne s'identifie chez Garmin et Claude reçoit
+  le jeton tout seul. Demande la variable d'environnement OAUTH_SECRET.
+- En-têtes : clé API personnelle Garmin (Authorization) pour la lecture, et jeton de publication
+  (X-Auth-Token, donné par /connexion) pour les séances.
+
+Le serveur ne conserve rien : tout ce qu'il délivre est chiffré et renvoyé par Claude à chaque requête.
 """
 
 import base64
+import hashlib
 import html
 import json
+import os
 import re
 import secrets
+import time
+import zlib
 from urllib.parse import parse_qs
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
@@ -18,10 +27,23 @@ from xml.etree import ElementTree
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from cryptography.fernet import Fernet, InvalidToken
+from mcp.server.auth.provider import (
+    AccessToken,
+    AuthorizationCode,
+    AuthorizationParams,
+    RefreshToken,
+    RegistrationError,
+    TokenError,
+    construct_redirect_uri,
+)
+from mcp.server.auth.routes import build_metadata
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import BaseModel, Field
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from pydantic import AnyHttpUrl, BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 from typing_extensions import TypedDict
 
@@ -35,14 +57,232 @@ AUTHORIZATION = re.compile(r"ApiKey ([A-Za-z0-9._~+/=-]{1,1024})", re.IGNORECASE
 JETON_PUBLICATION = re.compile(r"([A-Za-z0-9_-]{1,128}):([A-Za-z0-9._~+/=-]{1,1024})")
 EN_TETE_PUBLICATION = "X-Auth-Token"
 
+# ---------------------------------------------------------------- OAuth sans stockage
+
+PREFIXE_EN_TETES = "en-tetes."
+DUREE_ACCES_S = 3600
+DUREE_CODE_S = 300
+DUREE_DEMANDE_S = 1800
+REDIRECTIONS_CLAUDE = ("https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback")
+REDIRECTION_LOCALE = re.compile(r"http://(localhost|127\.0\.0\.1)(:\d{1,5})?/[^\s]*")
+
+
+def _url_publique() -> str:
+    """Adresse publique du site : URL_PUBLIQUE, sinon celle que Vercel annonce pour ce déploiement."""
+    if os.getenv("URL_PUBLIQUE"):
+        return os.environ["URL_PUBLIQUE"].rstrip("/")
+    if os.getenv("VERCEL_ENV") == "production":
+        hote = os.getenv("VERCEL_PROJECT_PRODUCTION_URL")
+    else:
+        hote = os.getenv("VERCEL_BRANCH_URL") or os.getenv("VERCEL_URL")
+    return f"https://{hote}" if hote else "http://localhost:8000"
+
+
+URL_PUBLIQUE = _url_publique()
+
+
+def _chiffre() -> Fernet | None:
+    """Chiffrement dérivé d'OAUTH_SECRET ; None si la variable est absente ou trop courte."""
+    secret = os.getenv("OAUTH_SECRET", "")
+    if len(secret) < 32:
+        return None
+    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()))
+
+
+def _sceller(genre: str, contenu: dict[str, Any]) -> str:
+    chiffre = _chiffre()
+    if chiffre is None:
+        raise RuntimeError("OAUTH_SECRET absent")
+    brut = json.dumps({"_": genre, **contenu}, separators=(",", ":")).encode()
+    return chiffre.encrypt(zlib.compress(brut)).decode().rstrip("=")
+
+
+def _ouvrir(jeton: str, genre: str, duree_s: int | None = None) -> dict[str, Any] | None:
+    """Déchiffre un jeton scellé ; None s'il est illisible, d'un autre genre ou expiré."""
+    chiffre = _chiffre()
+    if chiffre is None or not jeton or len(jeton) > 8192:
+        return None
+    try:
+        brut = chiffre.decrypt((jeton + "=" * (-len(jeton) % 4)).encode(), ttl=duree_s)
+        contenu = json.loads(zlib.decompress(brut))
+    except (InvalidToken, ValueError, zlib.error):
+        return None
+    return contenu if isinstance(contenu, dict) and contenu.get("_") == genre else None
+
+
+def _empreinte(texte: str) -> str:
+    return hashlib.sha256(texte.encode()).hexdigest()[:32]
+
+
+def _renouveler_garmin(garmin: list[str]) -> list[str]:
+    """Demande à Garmin un jeton de renouvellement plus récent. Lève si Garmin refuse l'ancien."""
+    from garminconnect import Garmin
+
+    client = Garmin().client
+    client.loads(json.dumps({"di_token": "-", "di_client_id": garmin[0], "di_refresh_token": garmin[1]}))
+    client._refresh_di_token()
+    return [str(client.di_client_id), str(client.di_refresh_token)]
+
+
+class CodeGarmin(AuthorizationCode):
+    garmin: list[str]
+
+
+class RenouvellementGarmin(RefreshToken):
+    garmin: list[str]
+
+
+class FournisseurOAuth:
+    """Serveur d'autorisation OAuth dont l'état tient entièrement dans des jetons chiffrés."""
+
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        fiche = _ouvrir(client_id, "client")
+        if fiche is None:
+            return None
+        return OAuthClientInformationFull(
+            client_id=client_id,
+            client_secret=fiche.get("k"),
+            redirect_uris=fiche["r"],
+            token_endpoint_auth_method=fiche["m"],
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            client_name=fiche.get("n"),
+            scope=fiche.get("s"),
+        )
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        if _chiffre() is None:
+            raise RegistrationError("invalid_client_metadata", "OAuth non configuré : variable OAUTH_SECRET absente")
+        adresses = [str(u) for u in client_info.redirect_uris or []]
+        if not adresses or any(
+            a not in REDIRECTIONS_CLAUDE and not REDIRECTION_LOCALE.fullmatch(a) for a in adresses
+        ):
+            raise RegistrationError("invalid_redirect_uri", "Seul Claude peut se connecter à ce serveur.")
+        client_info.client_secret_expires_at = None
+        client_info.client_id = _sceller(
+            "client",
+            {
+                "r": adresses,
+                "m": client_info.token_endpoint_auth_method,
+                "k": client_info.client_secret,
+                "n": (client_info.client_name or "")[:80] or None,
+                "s": client_info.scope,
+            },
+        )
+
+    async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
+        demande = _sceller(
+            "demande",
+            {
+                "h": _empreinte(str(client.client_id)),
+                "r": str(params.redirect_uri),
+                "e": params.redirect_uri_provided_explicitly,
+                "p": params.code_challenge,
+                "s": params.scopes or [],
+                "t": params.state,
+                "u": params.resource,
+            },
+        )
+        return f"/connexion?demande={demande}"
+
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> CodeGarmin | None:
+        contenu = _ouvrir(authorization_code, "code", DUREE_CODE_S)
+        if contenu is None or contenu["h"] != _empreinte(str(client.client_id)):
+            return None
+        return CodeGarmin(
+            code=authorization_code,
+            scopes=contenu["s"],
+            expires_at=time.time() + 60,  # la durée de vie réelle est vérifiée au déchiffrement
+            client_id=str(client.client_id),
+            code_challenge=contenu["p"],
+            redirect_uri=contenu["r"],
+            redirect_uri_provided_explicitly=contenu["e"],
+            resource=contenu["u"],
+            garmin=contenu["g"],
+        )
+
+    def _jetons(self, client: OAuthClientInformationFull, garmin: list[str], scopes: list[str]) -> OAuthToken:
+        empreinte = _empreinte(str(client.client_id))
+        return OAuthToken(
+            access_token=_sceller("acces", {"g": garmin, "h": empreinte}),
+            token_type="Bearer",
+            expires_in=DUREE_ACCES_S,
+            refresh_token=_sceller("renouvellement", {"g": garmin, "h": empreinte, "s": scopes}),
+            scope=" ".join(scopes) or None,
+        )
+
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: CodeGarmin
+    ) -> OAuthToken:
+        return self._jetons(client, authorization_code.garmin, authorization_code.scopes)
+
+    async def load_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: str
+    ) -> RenouvellementGarmin | None:
+        contenu = _ouvrir(refresh_token, "renouvellement")
+        if contenu is None or contenu["h"] != _empreinte(str(client.client_id)):
+            return None
+        return RenouvellementGarmin(
+            token=refresh_token, client_id=str(client.client_id), scopes=contenu["s"], garmin=contenu["g"]
+        )
+
+    async def exchange_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: RenouvellementGarmin, scopes: list[str]
+    ) -> OAuthToken:
+        from garminconnect import GarminConnectAuthenticationError
+
+        garmin = refresh_token.garmin
+        try:
+            # Profite du renouvellement côté Claude pour faire avancer le jeton côté Garmin.
+            garmin = await run_in_threadpool(_renouveler_garmin, garmin)
+        except GarminConnectAuthenticationError:
+            raise TokenError("invalid_grant", "Garmin a refusé le jeton : reconnecte-toi.") from None
+        except Exception:
+            pass  # Garmin indisponible : l'ancien jeton reste utilisable
+        return self._jetons(client, garmin, scopes or refresh_token.scopes)
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        if token.startswith(PREFIXE_EN_TETES):
+            # Connexion par en-têtes, convertie par le middleware : la clé et le jeton sont ceux de l'appelant.
+            try:
+                contenu = json.loads(base64.urlsafe_b64decode(token[len(PREFIXE_EN_TETES):]))
+            except ValueError:
+                return None
+            return AccessToken(token=token, client_id="en-tetes", scopes=[], claims=contenu)
+        contenu = _ouvrir(token, "acces", DUREE_ACCES_S + 60)
+        if contenu is None:
+            return None
+        return AccessToken(token=token, client_id=contenu["h"], scopes=[], claims={"garmin": contenu["g"]})
+
+    async def revoke_token(self, token: Any) -> None:
+        return None  # rien n'est stocké : un jeton cesse de servir quand Garmin le refuse
+
+
+def _identite(ctx: Context) -> dict[str, Any]:
+    """Ce que la requête apporte : {"cle": clé API ou None, "garmin": [client, jeton] ou None}."""
+    requete = ctx.request_context.request
+    utilisateur = requete.scope.get("user") if isinstance(requete, Request) else None
+    jeton = getattr(utilisateur, "access_token", None)
+    return (jeton.claims or {}) if jeton is not None else {}
+
+
 mcp = FastMCP(
     "Garmin",
     instructions=(
         "Lit les activités et indicateurs d'entraînement du compte Garmin connecté. "
-        "Avec un jeton de publication, creer_seance publie une séance structurée dans Garmin Connect "
-        "et la planifie au calendrier : donne toujours une date pour qu'elle arrive sur la montre. "
-        "Sans jeton, preparer_seance valide seulement la séance, qui n'est alors pas publiée. "
+        "creer_seance publie une séance structurée dans Garmin Connect et la planifie au calendrier : "
+        "donne toujours une date pour qu'elle arrive sur la montre. "
+        "Si le connecteur ne porte que la clé API, preparer_seance valide la séance sans la publier. "
         "Un GPX produit n'est jamais publié : il reste à importer."
+    ),
+    auth_server_provider=FournisseurOAuth(),
+    auth=AuthSettings(
+        issuer_url=AnyHttpUrl(URL_PUBLIQUE),
+        resource_server_url=AnyHttpUrl(f"{URL_PUBLIQUE}/mcp"),
+        client_registration_options=ClientRegistrationOptions(enabled=True),
+        validate_token_resource=False,
     ),
     stateless_http=True,
     json_response=True,
@@ -52,15 +292,26 @@ mcp = FastMCP(
 
 
 def _lire_garmin(ctx: Context, chemin: str, params: dict[str, str | int] | None = None) -> Any:
-    requete = ctx.request_context.request
-    if not isinstance(requete, Request) or not hasattr(requete.state, "cle_garmin"):
-        raise ToolError("Ajoute la clé API personnelle Garmin dans les en-têtes du connecteur Claude.")
+    """Lit Garmin avec la clé API personnelle si le connecteur en porte une, sinon avec la session Garmin."""
+    cle = _identite(ctx).get("cle")
+    if cle is None:
+        garmin = _garmin_session(ctx)
+        from garminconnect import GarminConnectNotFoundError, GarminConnectTooManyRequestsError
+
+        try:
+            return garmin.connectapi(chemin, params=params) or None
+        except GarminConnectNotFoundError:
+            return None
+        except GarminConnectTooManyRequestsError:
+            raise ToolError("Garmin limite les requêtes. Réessaie dans un instant.") from None
+        except Exception:
+            raise ToolError("Garmin est indisponible ou a renvoyé une réponse inattendue.") from None
 
     try:
         with httpx.Client(base_url=GARMIN_API, timeout=10, trust_env=False) as client:
             autorisation = client.post(
                 GARMIN_TOKEN_PATH,
-                headers={"Authorization": f"ApiKey {requete.state.cle_garmin}"},
+                headers={"Authorization": f"ApiKey {cle}"},
             )
             if autorisation.status_code in (400, 401, 403):
                 raise ToolError("Garmin a refusé la clé personnelle. Vérifie la clé et sa date d'expiration.")
@@ -223,14 +474,13 @@ def preparer_seance(
 # ---------------------------------------------------------------- publication
 
 
-def _garmin_publication(ctx: Context) -> Any:
-    """Client Garmin ouvert avec le jeton de publication de la requête. Rien n'est conservé."""
-    requete = ctx.request_context.request
-    jeton = getattr(requete.state, "jeton_publication", None) if isinstance(requete, Request) else None
+def _garmin_session(ctx: Context) -> Any:
+    """Client Garmin ouvert avec le jeton Garmin de la requête (OAuth ou en-tête). Rien n'est conservé."""
+    jeton = _identite(ctx).get("garmin")
     if jeton is None:
         raise ToolError(
-            "Publication non activée pour ce connecteur. Ouvre la page /connexion de ce site, "
-            f"connecte-toi à Garmin, puis ajoute l'en-tête {EN_TETE_PUBLICATION} au connecteur Claude."
+            "Ce connecteur ne porte que la clé API, qui ne permet pas de publier. Reconnecte-le en OAuth, "
+            f"ou ajoute-lui l'en-tête {EN_TETE_PUBLICATION} avec le jeton donné par la page /connexion."
         )
     from garminconnect import Garmin, GarminConnectAuthenticationError, GarminConnectTooManyRequestsError
 
@@ -245,8 +495,8 @@ def _garmin_publication(ctx: Context) -> Any:
         raise ToolError("Garmin limite les requêtes. Réessaie dans un instant.") from None
     except GarminConnectAuthenticationError:
         raise ToolError(
-            "Garmin a refusé le jeton de publication. Refais la connexion sur la page /connexion "
-            f"et remplace l'en-tête {EN_TETE_PUBLICATION} du connecteur."
+            "Garmin a refusé le jeton. Reconnecte le connecteur Garmin dans Claude ; en mode en-têtes, "
+            f"refais la connexion sur la page /connexion et remplace l'en-tête {EN_TETE_PUBLICATION}."
         ) from None
     except Exception:
         raise ToolError("Garmin est indisponible ou a renvoyé une réponse inattendue.") from None
@@ -261,7 +511,7 @@ def _publier(action: Any) -> Any:
     except GarminConnectTooManyRequestsError:
         raise ToolError("Garmin limite les requêtes. Réessaie dans un instant.") from None
     except GarminConnectAuthenticationError:
-        raise ToolError("Garmin a refusé l'opération. Refais la connexion sur la page /connexion.") from None
+        raise ToolError("Garmin a refusé l'opération. Reconnecte le connecteur Garmin dans Claude.") from None
     except Exception as erreur:
         raise ToolError(f"Garmin a refusé ou n'a pas terminé l'opération ({type(erreur).__name__}).") from None
 
@@ -281,7 +531,7 @@ def creer_seance(
 ) -> dict[str, Any]:
     """Publie une séance structurée dans Garmin Connect et, avec `date_prevue`, la planifie au calendrier.
 
-    Demande le jeton de publication (en-tête X-Auth-Token du connecteur, obtenu sur la page /connexion).
+    Demande un connecteur relié en OAuth, ou l'en-tête X-Auth-Token obtenu sur la page /connexion.
     """
     if date_prevue is not None:
         try:
@@ -295,7 +545,7 @@ def creer_seance(
     except ValueError as erreur:
         raise ToolError(str(erreur)) from None
 
-    garmin = _garmin_publication(ctx)
+    garmin = _garmin_session(ctx)
     id_seance = _publier(lambda: garmin.upload_workout(seance))["workoutId"]
     resultat: dict[str, Any] = {
         "id_seance": id_seance,
@@ -319,8 +569,8 @@ def creer_seance(
 
 @mcp.tool()
 def lister_seances(ctx: Context, limite: Annotated[int, Field(ge=1, le=100)] = 20) -> list[dict[str, Any]]:
-    """Liste les dernières séances de la bibliothèque Garmin Connect. Demande le jeton de publication."""
-    garmin = _garmin_publication(ctx)
+    """Liste les dernières séances de la bibliothèque Garmin Connect."""
+    garmin = _garmin_session(ctx)
     return [
         {
             "id_seance": s.get("workoutId"),
@@ -334,11 +584,8 @@ def lister_seances(ctx: Context, limite: Annotated[int, Field(ge=1, le=100)] = 2
 
 @mcp.tool()
 def supprimer_seance(ctx: Context, id_seance: Annotated[int, Field(gt=0)]) -> dict[str, Any]:
-    """Supprime définitivement une séance de la bibliothèque Garmin Connect et du calendrier.
-
-    Demande le jeton de publication.
-    """
-    garmin = _garmin_publication(ctx)
+    """Supprime définitivement une séance de la bibliothèque Garmin Connect et du calendrier."""
+    garmin = _garmin_session(ctx)
     _publier(lambda: garmin.delete_workout(id_seance))
     return {"supprimee": id_seance}
 
@@ -389,33 +636,66 @@ app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
 
 @app.middleware("http")
 async def proteger_mcp(request: Request, call_next):
-    if request.url.path == "/connexion":
-        return await call_next(request)
-
+    """Convertit la connexion par en-têtes en jeton interne ; le reste suit le parcours OAuth."""
     en_tetes = request.headers.getlist("authorization")
-    autorisation = AUTHORIZATION.fullmatch(en_tetes[0]) if len(en_tetes) == 1 else None
-    if autorisation is None:
-        return JSONResponse(
-            {"error": "Clé API personnelle Garmin requise"},
-            headers={"Cache-Control": "no-store"},
-            status_code=401,
-        )
+    cle = AUTHORIZATION.fullmatch(en_tetes[0]) if len(en_tetes) == 1 else None
+    if cle is not None:
+        identite: dict[str, Any] = {"cle": cle.group(1), "garmin": None}
+        publication = request.headers.getlist(EN_TETE_PUBLICATION)
+        if publication:
+            jeton = JETON_PUBLICATION.fullmatch(publication[0].strip()) if len(publication) == 1 else None
+            if jeton is None:
+                return JSONResponse(
+                    {"error": f"En-tête {EN_TETE_PUBLICATION} illisible : recopie le jeton donné par /connexion"},
+                    headers={"Cache-Control": "no-store"},
+                    status_code=401,
+                )
+            identite["garmin"] = [jeton.group(1), jeton.group(2)]
+        interne = PREFIXE_EN_TETES + base64.urlsafe_b64encode(json.dumps(identite).encode()).decode()
+        request.scope["headers"] = [
+            (nom, valeur) for nom, valeur in request.scope["headers"]
+            if nom not in (b"authorization", EN_TETE_PUBLICATION.lower().encode())
+        ] + [(b"authorization", f"Bearer {interne}".encode())]
 
-    publication = request.headers.getlist(EN_TETE_PUBLICATION)
-    if publication:
-        jeton = JETON_PUBLICATION.fullmatch(publication[0].strip()) if len(publication) == 1 else None
-        if jeton is None:
-            return JSONResponse(
-                {"error": f"En-tête {EN_TETE_PUBLICATION} illisible : recopie le jeton donné par /connexion"},
-                headers={"Cache-Control": "no-store"},
-                status_code=401,
-            )
-        request.state.jeton_publication = (jeton.group(1), jeton.group(2))
-
-    request.state.cle_garmin = autorisation.group(1)
     response = await call_next(request)
     response.headers["Cache-Control"] = "no-store"
+    defi = response.headers.get("www-authenticate")
+    if defi:
+        # Le SDK annonce l'adresse connue au démarrage : on la remplace par celle réellement appelée.
+        response.headers["www-authenticate"] = defi.replace(URL_PUBLIQUE, _origine(request))
     return response
+
+
+def _origine(request: Request) -> str:
+    """Adresse par laquelle le site est appelé, pour que n'importe quel domaine du déploiement fonctionne."""
+    hote = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+    if not re.fullmatch(r"[A-Za-z0-9.-]{1,253}(:\d{1,5})?", hote):
+        return URL_PUBLIQUE
+    local = hote.split(":")[0] in ("localhost", "127.0.0.1")
+    return f"{'http' if local else 'https'}://{hote}"
+
+
+@app.get("/.well-known/oauth-authorization-server")
+def metadonnees_oauth(request: Request) -> JSONResponse:
+    """Métadonnées du serveur d'autorisation ; annonce aussi les clients publics, comme Claude."""
+    metadonnees = build_metadata(
+        AnyHttpUrl(_origine(request)), None, ClientRegistrationOptions(enabled=True), RevocationOptions()
+    )
+    metadonnees.token_endpoint_auth_methods_supported = ["none", "client_secret_post", "client_secret_basic"]
+    return JSONResponse(
+        metadonnees.model_dump(mode="json", exclude_none=True),
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
+
+
+@app.get("/.well-known/oauth-protected-resource")
+@app.get("/.well-known/oauth-protected-resource/mcp")
+def metadonnees_ressource(request: Request) -> JSONResponse:
+    origine = _origine(request)
+    return JSONResponse(
+        {"resource": f"{origine}/mcp", "authorization_servers": [f"{origine}/"], "bearer_methods_supported": ["header"]},
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
 
 
 # ---------------------------------------------------------------- page de connexion
@@ -467,13 +747,18 @@ def _page(corps: str, statut: int = 200, script: str = "") -> HTMLResponse:
     )
 
 
-def _page_identifiants(erreur: str = "", statut: int = 200) -> HTMLResponse:
+def _champ_demande(demande: str) -> str:
+    return f'<input type="hidden" name="demande" value="{html.escape(demande, quote=True)}">' if demande else ""
+
+
+def _page_identifiants(erreur: str = "", statut: int = 200, demande: str = "") -> HTMLResponse:
     alerte = f'<p class="alerte">{html.escape(erreur)}</p>' if erreur else ""
+    but = "relier Claude à ton compte Garmin" if demande else "obtenir ton jeton de publication"
     return _page(
         "<h1>Connexion Garmin</h1>"
-        "<p>Connecte-toi pour obtenir ton jeton de publication. Ton e-mail et ton mot de passe "
+        f"<p>Connecte-toi pour {but}. Ton e-mail et ton mot de passe "
         "sont transmis à Garmin et ne sont ni enregistrés ni journalisés par ce site.</p>"
-        f'{alerte}<form method="post" action="/connexion" autocomplete="on">'
+        f'{alerte}<form method="post" action="/connexion" autocomplete="on">{_champ_demande(demande)}'
         '<label for="email">E-mail Garmin</label>'
         '<input id="email" name="email" type="email" autocomplete="username" required>'
         '<label for="mot_de_passe">Mot de passe</label>'
@@ -483,12 +768,12 @@ def _page_identifiants(erreur: str = "", statut: int = 200) -> HTMLResponse:
     )
 
 
-def _page_code(etat: str, erreur: str = "", statut: int = 200) -> HTMLResponse:
+def _page_code(etat: str, erreur: str = "", statut: int = 200, demande: str = "") -> HTMLResponse:
     alerte = f'<p class="alerte">{html.escape(erreur)}</p>' if erreur else ""
     return _page(
         "<h1>Code de vérification</h1>"
         "<p>Garmin t'a envoyé un code. Saisis-le pour terminer la connexion.</p>"
-        f'{alerte}<form method="post" action="/connexion" autocomplete="off">'
+        f'{alerte}<form method="post" action="/connexion" autocomplete="off">{_champ_demande(demande)}'
         f'<input type="hidden" name="etat" value="{html.escape(etat, quote=True)}">'
         '<label for="code">Code</label>'
         '<input id="code" name="code" inputmode="numeric" autocomplete="one-time-code" required>'
@@ -518,6 +803,24 @@ def _page_jeton(jeton: str) -> HTMLResponse:
     )
 
 
+def _page_retour(adresse: str) -> HTMLResponse:
+    """Renvoie vers Claude avec le code d'autorisation, sans dépendre d'une redirection de formulaire."""
+    return _page(
+        "<h1>Connexion réussie</h1><p>Retour vers Claude…</p>"
+        f'<p><a href="{html.escape(adresse, quote=True)}">Continuer vers Claude</a></p>',
+        script=f"location.replace({json.dumps(adresse).replace('<', chr(92) + 'u003c')});",
+    )
+
+
+def _page_demande_perimee() -> HTMLResponse:
+    return _page(
+        "<h1>Demande expirée</h1>"
+        '<p class="alerte">Cette demande de connexion n\'est plus valable.</p>'
+        "<p>Retourne dans Claude et relance la connexion du connecteur Garmin.</p>",
+        400,
+    )
+
+
 def _connexion_garmin(champs: dict[str, str]) -> tuple[str, str]:
     """Renvoie ("jeton", valeur) ou ("code", état à renvoyer avec le code de vérification)."""
     from garminconnect import Garmin
@@ -540,8 +843,10 @@ def _connexion_garmin(champs: dict[str, str]) -> tuple[str, str]:
 
 
 @app.get("/connexion")
-def page_connexion() -> HTMLResponse:
-    return _page_identifiants()
+def page_connexion(demande: str = "") -> HTMLResponse:
+    if demande and _ouvrir(demande, "demande", DUREE_DEMANDE_S) is None:
+        return _page_demande_perimee()
+    return _page_identifiants(demande=demande)
 
 
 @app.post("/connexion")
@@ -556,11 +861,17 @@ async def connexion(request: Request) -> HTMLResponse:
     except ValueError:
         return _page_identifiants("Formulaire illisible.", 400)
     etat = champs.get("etat", "")
+    demande = champs.get("demande", "")
+    autorisation = _ouvrir(demande, "demande", DUREE_DEMANDE_S) if demande else None
+    if demande and autorisation is None:
+        return _page_demande_perimee()
     if not etat and not (champs.get("email") and champs.get("mot_de_passe")):
-        return _page_identifiants("Saisis ton e-mail et ton mot de passe.", 400)
+        return _page_identifiants("Saisis ton e-mail et ton mot de passe.", 400, demande)
 
     def retour(message: str, statut: int) -> HTMLResponse:
-        return _page_code(etat, message, statut) if etat else _page_identifiants(message, statut)
+        if etat:
+            return _page_code(etat, message, statut, demande)
+        return _page_identifiants(message, statut, demande)
 
     try:
         etape, valeur = await run_in_threadpool(_connexion_garmin, champs)
@@ -570,7 +881,12 @@ async def connexion(request: Request) -> HTMLResponse:
         return retour("Garmin a refusé le code." if etat else "Garmin a refusé ces identifiants.", 401)
     except Exception:
         return retour("Garmin est indisponible ou a bloqué la connexion depuis ce site. Réessaie plus tard.", 502)
-    return _page_code(valeur) if etape == "code" else _page_jeton(valeur)
+    if etape == "code":
+        return _page_code(valeur, demande=demande)
+    if autorisation is None:
+        return _page_jeton(valeur)
+    code = _sceller("code", {**{c: autorisation[c] for c in "hrepsu"}, "g": valeur.split(":", 1)})
+    return _page_retour(construct_redirect_uri(autorisation["r"], code=code, state=autorisation["t"]))
 
 
 app.mount("/", mcp_app)

@@ -40,20 +40,34 @@ claude mcp add garmin -- python C:\Users\<toi>\garmin-mcp\server.py
 
 ## Utiliser Garmin dans Claude sur le web et sur mobile
 
-Chaque personne ajoute le connecteur distant dans son propre compte Claude avec sa propre clé API personnelle Garmin. La même adresse sert à tous.
+Chaque personne ajoute le connecteur distant dans son propre compte Claude, soit en OAuth (voir plus bas), soit avec sa propre clé API personnelle Garmin comme décrit ici. La même adresse sert à tous.
 
 1. Connecte-toi à Garmin Connect Web et termine la double authentification sur Garmin si elle est demandée. Crée ensuite ta clé API personnelle et choisis sa durée de validité. [Procédure Garmin](https://developer.garmin.com/gc-developer-program/personal/personal-api/)
 2. Sur [claude.ai](https://claude.ai), ouvre **Personnaliser → Connecteurs → Ajouter → Personnalisé → Web**. Nomme le connecteur **Garmin** et saisis `https://mcp-garmin-claude.vercel.app/mcp`.
 3. Choisis **Pas de connexion** pour l'option OAuth. Dans **En-têtes de requête**, sélectionne `Authorization` et mets `ApiKey TA_CLÉ_GARMIN` comme valeur, avec un espace après `ApiKey`. Marque l'en-tête comme obligatoire. Claude déploie cette fonction progressivement. [Configuration des en-têtes dans Claude](https://claude.com/docs/connectors/custom/add-unlisted#authenticate-with-request-headers)
 4. Dans une conversation Claude sur le web, sur iOS ou sur Android, active **Garmin** et demande « Donne-moi la date, le sport et la distance de ma dernière activité Garmin. » Compare le résultat avec Garmin Connect.
 
-Claude conserve la clé personnelle dans la configuration du connecteur. À chaque lecture, le serveur échange la clé contre un jeton Garmin et utilise ce jeton pour la requête. Le serveur ne conserve ni la clé ni le jeton et aucune variable Garmin n'est à renseigner sur Vercel. L'accès fonctionne entre les conversations et les redémarrages du serveur jusqu'à l'expiration ou la révocation de la clé. Dans ce cas, crée une nouvelle clé dans Garmin Connect Web et renseigne-la dans Claude. [Durée et révocation des clés](https://developer.garmin.com/gc-developer-program/personal/personal-faq/)
+Claude conserve la clé personnelle dans la configuration du connecteur. À chaque lecture, le serveur échange la clé contre un jeton Garmin et utilise ce jeton pour la requête. Le serveur ne conserve ni la clé ni le jeton et ce mode ne demande aucune variable sur Vercel. L'accès fonctionne entre les conversations et les redémarrages du serveur jusqu'à l'expiration ou la révocation de la clé. Dans ce cas, crée une nouvelle clé dans Garmin Connect Web et renseigne-la dans Claude. [Durée et révocation des clés](https://developer.garmin.com/gc-developer-program/personal/personal-faq/)
 
 Pour héberger ta propre instance, déploie `app.py`, `server.py` et `requirements.txt` avec le préréglage FastAPI sur Vercel. Vérifie que `/mcp` refuse une requête sans clé avec le statut HTTP 401.
 
-### Publier des séances depuis le téléphone
+### Se connecter en OAuth
 
-La clé personnelle ne permet que la lecture. Pour publier, chaque personne ajoute à son connecteur un jeton de publication obtenu sur la page de connexion du site. Tout se fait depuis le téléphone.
+C'est le parcours le plus simple : aucune clé ni jeton à copier. Il demande la variable `OAUTH_SECRET` sur Vercel (voir plus bas).
+
+1. Sur [claude.ai](https://claude.ai), ouvre **Personnaliser → Connecteurs → Ajouter → Personnalisé → Web**. Nomme le connecteur **Garmin**, saisis l'adresse du site suivie de `/mcp` et garde la connexion OAuth avec l'enregistrement automatique.
+2. Claude ouvre la page de connexion du site. Saisis ton e-mail et ton mot de passe Garmin, puis le code de vérification si Garmin en envoie un.
+3. La page te renvoie vers Claude, qui reçoit le jeton et le range dans le connecteur.
+
+En OAuth, la lecture et la publication passent toutes deux par la session Garmin, donc par la bibliothèque non officielle `garminconnect`. La clé API personnelle n'est plus nécessaire. Si Garmin refuse un jour le jeton, Claude propose de reconnecter le connecteur.
+
+Le serveur ne stocke rien. Ce qu'il délivre à Claude (identifiant de client, code, jetons) est chiffré avec `OAUTH_SECRET` et lui revient à chaque requête. Seul Claude peut s'enregistrer : les adresses de retour autres que celles de Claude sont refusées.
+
+**Variable à créer sur Vercel** : `OAUTH_SECRET`, une chaîne aléatoire d'au moins 32 caractères, pour les environnements Production et Preview, puis redéploie. Change-la et toutes les connexions OAuth existantes sont à refaire. Sans cette variable, seule la connexion par en-têtes fonctionne.
+
+### Publier des séances avec les en-têtes, sans OAuth
+
+Sans OAuth, la clé personnelle ne permet que la lecture. Pour publier, chaque personne ajoute à son connecteur un jeton de publication obtenu sur la page de connexion du site. Tout se fait depuis le téléphone.
 
 1. Ouvre `https://mcp-garmin-claude.vercel.app/connexion` et connecte-toi avec ton e-mail et ton mot de passe Garmin, puis le code de vérification s'il est demandé.
 2. Copie le jeton affiché. Il donne accès à ton compte Garmin : traite-le comme un mot de passe.
@@ -73,9 +87,9 @@ La publication passe par la bibliothèque non officielle `garminconnect`, comme 
 | `detail_activite` | Mesures détaillées à partir de l'identifiant fourni par l'historique. |
 | `indicateurs_entrainement` | Sommeil, VFC, Body Battery, VO₂ max, résumé quotidien ou zones de fréquence cardiaque. |
 | `preparer_seance` | Valide une séance de course, vélo ou natation avec étapes, répétitions et cibles, sans la publier. |
-| `creer_seance` | Publie la séance dans Garmin Connect et, avec une date, la met au calendrier. Demande le jeton de publication. |
-| `lister_seances` | Liste les séances de la bibliothèque. Demande le jeton de publication. |
-| `supprimer_seance` | Supprime une séance. Demande le jeton de publication. |
+| `creer_seance` | Publie la séance dans Garmin Connect et, avec une date, la met au calendrier. Demande OAuth ou le jeton de publication. |
+| `lister_seances` | Liste les séances de la bibliothèque. Demande OAuth ou le jeton de publication. |
+| `supprimer_seance` | Supprime une séance. Demande OAuth ou le jeton de publication. |
 | `exporter_parcours_gpx` | Produit le contenu d'un fichier GPX à partir des points ordonnés d'un tracé. Enregistre ce contenu dans un fichier `.gpx`, puis importe-le dans Garmin Connect. |
 
 La clé personnelle permet la lecture et le jeton de publication permet de créer des séances. La publication d'un parcours GPX, elle, demande un accès autorisé aux API Business [Training](https://developer.garmin.com/gc-developer-program/enterprise/training-api/) et [Courses](https://developer.garmin.com/gc-developer-program/enterprise/courses-api/). Garmin décrit l'[import manuel d'un GPX](https://support.garmin.com/en-GB/?faq=wKuZXCaZRP4mWPX5aRz5h5) sur le web et sur mobile.
