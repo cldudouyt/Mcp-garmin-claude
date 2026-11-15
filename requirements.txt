@@ -1,0 +1,3 @@
+fastapi==0.163.1
+garminconnect==0.3.20
+mcp==1.30.0
