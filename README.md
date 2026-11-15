@@ -1,0 +1,63 @@
+# MCP Garmin
+
+Crée des séances structurées depuis Claude et les envoie sur Garmin Connect, qui les synchronise sur la montre. Pas de câble.
+
+## Installation (Windows)
+
+1. Mets `server.py` dans un dossier, par exemple `C:\Users\<toi>\garmin-mcp\`.
+2. Installe les dépendances :
+   ```
+   pip install garminconnect mcp
+   ```
+3. Connecte-toi à Garmin une seule fois (e-mail, mot de passe, code de vérification si demandé) :
+   ```
+   python C:\Users\<toi>\garmin-mcp\server.py login
+   ```
+   Seuls des jetons sont enregistrés, dans `C:\Users\<toi>\.garminconnect`. Le mot de passe n'est pas conservé.
+
+## Brancher sur Claude
+
+**Application Claude pour ordinateur** : ouvre `%APPDATA%\Claude\claude_desktop_config.json` et ajoute :
+
+```json
+{
+  "mcpServers": {
+    "garmin": {
+      "command": "python",
+      "args": ["C:\\Users\\<toi>\\garmin-mcp\\server.py"]
+    }
+  }
+}
+```
+
+Puis quitte complètement Claude et relance-le.
+
+**Claude Code** :
+
+```
+claude mcp add garmin -- python C:\Users\<toi>\garmin-mcp\server.py
+```
+
+## Utilisation
+
+Demande simplement, par exemple : « Crée sur Garmin pour mardi 6 x 1000 m à 4:55-5:05, 15 min d'échauffement en zone 2, 2 min de récup, 10 min de retour au calme. »
+
+| Outil | Rôle |
+|---|---|
+| `creer_seance` | Crée la séance et, avec une date, la met au calendrier Garmin |
+| `lister_seances` | Liste les séances de la bibliothèque |
+| `supprimer_seance` | Supprime une séance |
+
+Sports : `course`, `velo`, `natation`.
+Fin d'étape : durée (`"10:00"`, `"45s"`), distance en mètres, ou bouton Lap si rien n'est donné.
+Cibles : allure min/km (course), zone ou plage de FC, zone ou plage de puissance, cadence.
+
+Avec une date, la séance apparaît sur la montre à la synchronisation suivante. Sans date, elle reste dans la bibliothèque Garmin Connect et il faut l'envoyer vers la montre à la main.
+
+`simulation: true` renvoie le JSON Garmin sans rien envoyer : pratique pour vérifier une séance.
+
+## En cas de souci
+
+- « Pas connecté à Garmin » : relance `python server.py login`.
+- Garmin bloque parfois la connexion par mot de passe après plusieurs essais rapprochés : attends une heure avant de réessayer.
+- La bibliothèque `garminconnect` n'est pas officielle : si Garmin change son site, `pip install -U garminconnect` règle en général le problème.
