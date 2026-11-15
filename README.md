@@ -1,6 +1,6 @@
 # MCP Garmin
 
-Crée des séances structurées depuis Claude et les envoie sur Garmin Connect, qui les synchronise sur la montre. Pas de câble.
+Crée des séances structurées depuis Claude et les envoie sur Garmin Connect, qui les synchronise sur la montre. Pas de câble. Lit aussi tes activités récentes et ton état de forme pour adapter l'intensité des séances.
 
 ## Installation (Windows)
 
@@ -47,6 +47,8 @@ Demande simplement, par exemple : « Crée sur Garmin pour mardi 6 x 1000 m à 4
 | `creer_seance` | Crée la séance et, avec une date, la met au calendrier Garmin |
 | `lister_seances` | Liste les séances de la bibliothèque |
 | `supprimer_seance` | Supprime une séance |
+| `dernieres_activites` | Activités récentes : distance, durée, allure, FC, puissance, charge ; détail tour par tour en option |
+| `etat_de_forme` | VFC, sommeil, Body Battery, FC de repos, charge d'entraînement, VO2max, seuil lactique, prédictions de course |
 
 Sports : `course`, `velo`, `natation`.
 Fin d'étape : durée (`"10:00"`, `"45s"`), distance en mètres, ou bouton Lap si rien n'est donné.
@@ -55,6 +57,15 @@ Cibles : allure min/km (course), zone ou plage de FC, zone ou plage de puissance
 Avec une date, la séance apparaît sur la montre à la synchronisation suivante. Sans date, elle reste dans la bibliothèque Garmin Connect et il faut l'envoyer vers la montre à la main.
 
 `simulation: true` renvoie le JSON Garmin sans rien envoyer : pratique pour vérifier une séance.
+
+## Adapter l'intensité
+
+Demande par exemple : « Regarde ma forme et mes dernières séances, puis prépare mon fractionné de mardi. » Claude lit `etat_de_forme` et `dernieres_activites`, puis choisit les allures et le volume avant d'appeler `creer_seance`.
+
+- `dernieres_activites` couvre 14 jours par défaut (jusqu'à 90), avec un filtre par sport. `avec_tours: true` ajoute l'allure et la FC de chaque tour pour les 5 activités les plus récentes.
+- `etat_de_forme` donne le jour même par défaut, ou une date `AAAA-MM-JJ`. Ce que la montre ne mesure pas (par exemple le score de préparation à l'entraînement sur certains modèles) est listé dans `indisponible`.
+
+L'adaptation se fait à la création : une fois sur la montre, la séance ne change plus. Pour la modifier, supprime-la et recrée-la avant de synchroniser.
 
 ## En cas de souci
 

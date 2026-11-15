@@ -1,4 +1,5 @@
-"""MCP Garmin : créer des séances structurées depuis Claude et les envoyer sur Garmin Connect.
+"""MCP Garmin : créer des séances structurées depuis Claude et les envoyer sur Garmin Connect,
+et lire les activités récentes et l'état de forme pour adapter l'intensité des séances.
 
 Installation :   pip install garminconnect mcp
 Connexion (1x) : python server.py login
@@ -15,6 +16,7 @@ import os
 import re
 import sys
 from datetime import date as _date
+from datetime import timedelta
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -33,7 +35,9 @@ mcp = MCPServer(
     instructions=(
         "Crée des séances d'entraînement structurées sur Garmin Connect. "
         "Donne toujours une date à creer_seance pour que la séance arrive "
-        "toute seule sur la montre à la prochaine synchronisation."
+        "toute seule sur la montre à la prochaine synchronisation. "
+        "Pour adapter l'intensité, lis d'abord dernieres_activites (allures et FC "
+        "réellement tenues) et etat_de_forme (VFC, sommeil, charge) avant de créer la séance."
     ),
 )
 
@@ -396,6 +400,250 @@ def supprimer_seance(workout_id: int) -> dict[str, Any]:
     """Supprime définitivement une séance de la bibliothèque Garmin Connect (et du calendrier)."""
     _appel(lambda g: g.delete_workout(workout_id))
     return {"supprimee": workout_id}
+
+
+# ---------------------------------------------------------------- lecture (activités, forme)
+
+TYPES_ACTIVITE = {"course": "running", "velo": "cycling", "natation": "swimming"}
+
+
+def _mmss(secondes: float | None) -> str | None:
+    """Durée lisible : '5:12' ou '1:32:37'."""
+    if not secondes or secondes <= 0:
+        return None
+    s = round(secondes)
+    h, m, s = s // 3600, s % 3600 // 60, s % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _arrondi(valeur: Any, decimales: int = 0) -> Any:
+    if not isinstance(valeur, (int, float)):
+        return None
+    return round(valeur, decimales) if decimales else round(valeur)
+
+
+def _sans_vides(d: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in d.items() if v not in (None, {}, [])}
+
+
+def _rythme(vitesse_ms: float | None, type_garmin: str) -> dict[str, Any]:
+    """Vitesse en m/s -> allure min/km (course, marche), min/100 m (natation) ou km/h (reste)."""
+    if not vitesse_ms or vitesse_ms <= 0:
+        return {}
+    if "swim" in type_garmin:
+        return {"allure_100m": _mmss(100 / vitesse_ms)}
+    if any(t in type_garmin for t in ("run", "walk", "hik")):
+        return {"allure_km": _mmss(1000 / vitesse_ms)}
+    return {"vitesse_kmh": round(vitesse_ms * 3.6, 1)}
+
+
+def _resume_activite(a: dict[str, Any]) -> dict[str, Any]:
+    type_garmin = (a.get("activityType") or {}).get("typeKey") or ""
+    return _sans_vides(
+        {
+            "activite_id": a.get("activityId"),
+            "date": a.get("startTimeLocal"),
+            "nom": a.get("activityName"),
+            "type": type_garmin,
+            "distance_km": _arrondi((a.get("distance") or 0) / 1000, 2) or None,
+            "duree": _mmss(a.get("duration")),
+            **_rythme(a.get("averageSpeed"), type_garmin),
+            "fc_moy": _arrondi(a.get("averageHR")),
+            "fc_max": _arrondi(a.get("maxHR")),
+            "puissance_moy_w": _arrondi(a.get("avgPower")),
+            "puissance_normalisee_w": _arrondi(a.get("normPower")),
+            "cadence_moy": _arrondi(
+                a.get("averageRunningCadenceInStepsPerMinute") or a.get("averageBikingCadenceInRevPerMinute")
+            ),
+            "denivele_m": _arrondi(a.get("elevationGain")),
+            "effet_aerobie": _arrondi(a.get("aerobicTrainingEffect"), 1),
+            "effet_anaerobie": _arrondi(a.get("anaerobicTrainingEffect"), 1),
+            "charge": _arrondi(a.get("activityTrainingLoad")),
+            "vo2max": _arrondi(a.get("vO2MaxValue")),
+        }
+    )
+
+
+def _tours(activite_id: int, type_garmin: str) -> list[dict[str, Any]]:
+    tours = (_appel(lambda g: g.get_activity_splits(activite_id)) or {}).get("lapDTOs") or []
+    return [
+        _sans_vides(
+            {
+                "tour": t.get("lapIndex"),
+                "phase": (t.get("intensityType") or "").lower() or None,
+                "distance_m": _arrondi(t.get("distance")),
+                "duree": _mmss(t.get("duration")),
+                **_rythme(t.get("averageSpeed"), type_garmin),
+                "fc_moy": _arrondi(t.get("averageHR")),
+                "fc_max": _arrondi(t.get("maxHR")),
+                "puissance_moy_w": _arrondi(t.get("averagePower")),
+            }
+        )
+        for t in tours
+    ]
+
+
+@mcp.tool()
+@_erreurs_lisibles
+def dernieres_activites(
+    jours: Annotated[int, Field(ge=1, le=90, description="Fenêtre en jours avant aujourd'hui")] = 14,
+    sport: Annotated[
+        Literal["course", "velo", "natation"] | None, Field(description="Filtre ; vide = tous les sports")
+    ] = None,
+    limite: Annotated[int, Field(ge=1, le=50)] = 20,
+    avec_tours: Annotated[
+        bool,
+        Field(description="True = ajoute le détail tour par tour (allure et FC de chaque répétition) des 5 plus récentes"),
+    ] = False,
+) -> list[dict[str, Any]]:
+    """Activités récentes enregistrées par la montre, de la plus récente à la plus ancienne :
+    distance, durée, allure ou vitesse, FC, puissance, charge et effet d'entraînement.
+
+    À lire avant de fixer les allures d'une séance. `avec_tours=True` montre ce qui a été
+    réellement tenu sur chaque répétition d'un fractionné.
+    """
+    aujourdhui = _date.today()
+    debut = (aujourdhui - timedelta(days=jours)).isoformat()
+    type_garmin = TYPES_ACTIVITE[sport] if sport else None
+    activites = _appel(lambda g: g.get_activities_by_date(debut, aujourdhui.isoformat(), type_garmin)) or []
+    activites.sort(key=lambda a: a.get("startTimeLocal") or "", reverse=True)
+    resultat = [_resume_activite(a) for a in activites[:limite]]
+    if avec_tours:
+        for r in resultat[:5]:
+            try:
+                r["tours"] = _tours(r["activite_id"], r.get("type", ""))
+            except Exception as exc:
+                r["tours_indisponibles"] = f"{type(exc).__name__}: {exc}"
+    return resultat
+
+
+def _forme_vfc(g, jour: str) -> dict[str, Any]:
+    v = (g.get_hrv_data(jour) or {}).get("hrvSummary") or {}
+    base = v.get("baseline") or {}
+    return {
+        "statut": v.get("status"),
+        "nuit_ms": v.get("lastNightAvg"),
+        "moyenne_7j_ms": v.get("weeklyAvg"),
+        "plage_normale_ms": f"{base['balancedLow']}-{base['balancedUpper']}" if base.get("balancedLow") else None,
+    }
+
+
+def _forme_sommeil(g, jour: str) -> dict[str, Any]:
+    d = (g.get_sleep_data(jour) or {}).get("dailySleepDTO") or {}
+    score = (d.get("sleepScores") or {}).get("overall") or {}
+    return {
+        "duree": _mmss(d.get("sleepTimeSeconds")),
+        "score": score.get("value"),
+        "qualite": score.get("qualifierKey"),
+        "profond": _mmss(d.get("deepSleepSeconds")),
+        "fc_moy": _arrondi(d.get("avgHeartRate")),
+    }
+
+
+def _forme_journee(g, jour: str) -> dict[str, Any]:
+    s = g.get_stats(jour) or {}
+    return {
+        "body_battery": s.get("bodyBatteryMostRecentValue"),
+        "body_battery_au_reveil": s.get("bodyBatteryAtWakeTime"),
+        "fc_repos": s.get("restingHeartRate"),
+        "fc_repos_moy_7j": s.get("lastSevenDaysAvgRestingHeartRate"),
+        "stress_moyen": s.get("averageStressLevel"),
+    }
+
+
+def _forme_preparation(g, jour: str) -> dict[str, Any]:
+    mesures = g.get_training_readiness(jour) or []
+    p = mesures[0] if mesures else {}
+    return {"score": p.get("score"), "niveau": p.get("level"), "recuperation_restante_min": p.get("recoveryTime")}
+
+
+def _forme_entrainement(g, jour: str) -> dict[str, Any]:
+    e = g.get_training_status(jour) or {}
+
+    def principal(appareils: dict[str, Any] | None) -> dict[str, Any]:
+        valeurs = list((appareils or {}).values())
+        return next((v for v in valeurs if v.get("primaryTrainingDevice")), valeurs[0] if valeurs else {})
+
+    statut = principal((e.get("mostRecentTrainingStatus") or {}).get("latestTrainingStatusData"))
+    charge = statut.get("acuteTrainingLoadDTO") or {}
+    equilibre = principal((e.get("mostRecentTrainingLoadBalance") or {}).get("metricsTrainingLoadBalanceDTOMap"))
+    vo2 = e.get("mostRecentVO2Max") or {}
+    return {
+        "statut": statut.get("trainingStatusFeedbackPhrase"),
+        "charge_aigue_7j": _arrondi(charge.get("dailyTrainingLoadAcute")),
+        "charge_chronique_28j": _arrondi(charge.get("dailyTrainingLoadChronic")),
+        "ratio_aigue_chronique": charge.get("dailyAcuteChronicWorkloadRatio"),
+        "niveau_de_charge": charge.get("acwrStatus"),
+        "equilibre_de_charge": equilibre.get("trainingBalanceFeedbackPhrase"),
+        "vo2max_course": (vo2.get("generic") or {}).get("vo2MaxValue"),
+        "vo2max_velo": (vo2.get("cycling") or {}).get("vo2MaxValue"),
+    }
+
+
+def _forme_seuil(g, jour: str) -> dict[str, Any]:
+    seuil = g.get_lactate_threshold() or {}
+    course = seuil.get("speed_and_heart_rate") or {}
+    vitesse = course.get("speed")  # Garmin renvoie la vitesse en dixièmes de m/s
+    return {
+        "fc": course.get("heartRate"),
+        "allure_km": _mmss(100 / vitesse) if vitesse else None,
+        "mesure_le": (course.get("calendarDate") or "")[:10] or None,
+        "puissance_w": (seuil.get("power") or {}).get("functionalThresholdPower"),
+    }
+
+
+def _forme_predictions(g, jour: str) -> dict[str, Any]:
+    p = g.get_race_predictions() or {}
+    return {
+        "5_km": _mmss(p.get("time5K")),
+        "10_km": _mmss(p.get("time10K")),
+        "semi": _mmss(p.get("timeHalfMarathon")),
+        "marathon": _mmss(p.get("timeMarathon")),
+    }
+
+
+RUBRIQUES_FORME = {
+    "vfc": _forme_vfc,
+    "sommeil": _forme_sommeil,
+    "journee": _forme_journee,
+    "preparation_entrainement": _forme_preparation,
+    "entrainement": _forme_entrainement,
+    "seuil_lactique": _forme_seuil,
+    "predictions_course": _forme_predictions,
+}
+
+
+@mcp.tool()
+@_erreurs_lisibles
+def etat_de_forme(
+    date: Annotated[str | None, Field(description="Jour AAAA-MM-JJ ; vide = aujourd'hui")] = None,
+) -> dict[str, Any]:
+    """État de forme du jour d'après Garmin : VFC nocturne, sommeil, Body Battery, FC de repos,
+    charge d'entraînement (aiguë / chronique), VO2max, seuil lactique et prédictions de course.
+
+    À lire avant de créer une séance pour décider de l'alléger (VFC basse, mauvais sommeil,
+    charge élevée) ou de la durcir. Une rubrique absente de la montre est listée dans `indisponible`.
+    """
+    jour = date or _date.today().isoformat()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", jour):
+        raise ValueError(f"Date illisible : {jour!r} (attendu AAAA-MM-JJ)")
+    _date.fromisoformat(jour)
+    resultat: dict[str, Any] = {"date": jour}
+    indisponible: list[str] = []
+    for nom, lire in RUBRIQUES_FORME.items():
+        try:
+            donnees = _sans_vides(_appel(lambda g: lire(g, jour)))
+        except RuntimeError:
+            raise  # pas connecté : inutile de continuer
+        except Exception:
+            donnees = {}
+        if donnees:
+            resultat[nom] = donnees
+        else:
+            indisponible.append(nom)
+    if indisponible:
+        resultat["indisponible"] = indisponible
+    return resultat
 
 
 # ---------------------------------------------------------------- connexion
