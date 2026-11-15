@@ -1,6 +1,15 @@
-"""MCP distant en lecture seule utilisant la clé Garmin de chaque requête."""
+"""MCP distant : lecture avec la clé API personnelle Garmin de chaque requête,
+publication de séances avec le jeton de publication fourni par la page /connexion.
 
+Le serveur ne conserve rien : la clé et le jeton voyagent dans les en-têtes du connecteur Claude.
+"""
+
+import base64
+import html
+import json
 import re
+import secrets
+from urllib.parse import parse_qs
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from typing import Annotated, Any, Literal
@@ -8,11 +17,12 @@ from xml.etree import ElementTree
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 from typing_extensions import TypedDict
 
 from server import Etape, Repetition, construire_seance
@@ -21,13 +31,18 @@ GARMIN_API = "https://personal.connectapi.garmin.com"
 GARMIN_TOKEN_PATH = "/personalapitoken-service/personal-api/personal-api-key/token"
 GARMIN_ACTIVITIES_PATH = "/activitylist-service/activities/search/activities"
 AUTHORIZATION = re.compile(r"ApiKey ([A-Za-z0-9._~+/=-]{1,1024})", re.IGNORECASE)
+# Jeton de publication : « identifiant client:jeton de renouvellement », délivré par /connexion.
+JETON_PUBLICATION = re.compile(r"([A-Za-z0-9_-]{1,128}):([A-Za-z0-9._~+/=-]{1,1024})")
+EN_TETE_PUBLICATION = "X-Auth-Token"
 
 mcp = FastMCP(
     "Garmin",
     instructions=(
         "Lit les activités et indicateurs d'entraînement du compte Garmin connecté. "
-        "Prépare des séances structurées et des tracés GPX à importer. "
-        "Une séance préparée ou un GPX produit n'a pas été publié dans Garmin Connect."
+        "Avec un jeton de publication, creer_seance publie une séance structurée dans Garmin Connect "
+        "et la planifie au calendrier : donne toujours une date pour qu'elle arrive sur la montre. "
+        "Sans jeton, preparer_seance valide seulement la séance, qui n'est alors pas publiée. "
+        "Un GPX produit n'est jamais publié : il reste à importer."
     ),
     stateless_http=True,
     json_response=True,
@@ -205,6 +220,129 @@ def preparer_seance(
     return {"nom": nom, "sport": sport, "publiee": False, "json_garmin": seance}
 
 
+# ---------------------------------------------------------------- publication
+
+
+def _garmin_publication(ctx: Context) -> Any:
+    """Client Garmin ouvert avec le jeton de publication de la requête. Rien n'est conservé."""
+    requete = ctx.request_context.request
+    jeton = getattr(requete.state, "jeton_publication", None) if isinstance(requete, Request) else None
+    if jeton is None:
+        raise ToolError(
+            "Publication non activée pour ce connecteur. Ouvre la page /connexion de ce site, "
+            f"connecte-toi à Garmin, puis ajoute l'en-tête {EN_TETE_PUBLICATION} au connecteur Claude."
+        )
+    from garminconnect import Garmin, GarminConnectAuthenticationError, GarminConnectTooManyRequestsError
+
+    garmin = Garmin()
+    try:
+        # Le jeton d'accès est redemandé à Garmin à chaque appel à partir du jeton de renouvellement.
+        garmin.client.loads(
+            json.dumps({"di_token": "-", "di_client_id": jeton[0], "di_refresh_token": jeton[1]})
+        )
+        garmin.client._refresh_di_token()
+    except GarminConnectTooManyRequestsError:
+        raise ToolError("Garmin limite les requêtes. Réessaie dans un instant.") from None
+    except GarminConnectAuthenticationError:
+        raise ToolError(
+            "Garmin a refusé le jeton de publication. Refais la connexion sur la page /connexion "
+            f"et remplace l'en-tête {EN_TETE_PUBLICATION} du connecteur."
+        ) from None
+    except Exception:
+        raise ToolError("Garmin est indisponible ou a renvoyé une réponse inattendue.") from None
+    return garmin
+
+
+def _publier(action: Any) -> Any:
+    from garminconnect import GarminConnectAuthenticationError, GarminConnectTooManyRequestsError
+
+    try:
+        return action()
+    except GarminConnectTooManyRequestsError:
+        raise ToolError("Garmin limite les requêtes. Réessaie dans un instant.") from None
+    except GarminConnectAuthenticationError:
+        raise ToolError("Garmin a refusé l'opération. Refais la connexion sur la page /connexion.") from None
+    except Exception as erreur:
+        raise ToolError(f"Garmin a refusé ou n'a pas terminé l'opération ({type(erreur).__name__}).") from None
+
+
+@mcp.tool()
+def creer_seance(
+    ctx: Context,
+    nom: Annotated[str, Field(min_length=1, max_length=128)],
+    sport: Literal["course", "velo", "natation"],
+    etapes: Annotated[list[Etape | Repetition], Field(min_length=1, max_length=50)],
+    date_prevue: Annotated[
+        str | None,
+        Field(description="Jour prévu AAAA-MM-JJ. Avec une date, la séance arrive seule sur la montre."),
+    ] = None,
+    description: str | None = None,
+    longueur_bassin_m: Annotated[int, Field(ge=1)] = 25,
+) -> dict[str, Any]:
+    """Publie une séance structurée dans Garmin Connect et, avec `date_prevue`, la planifie au calendrier.
+
+    Demande le jeton de publication (en-tête X-Auth-Token du connecteur, obtenu sur la page /connexion).
+    """
+    if date_prevue is not None:
+        try:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_prevue):
+                raise ValueError
+            date.fromisoformat(date_prevue)
+        except ValueError:
+            raise ToolError(f"Date illisible : {date_prevue!r} (attendu AAAA-MM-JJ)") from None
+    try:
+        seance = construire_seance(nom, sport, etapes, description, longueur_bassin_m)
+    except ValueError as erreur:
+        raise ToolError(str(erreur)) from None
+
+    garmin = _garmin_publication(ctx)
+    id_seance = _publier(lambda: garmin.upload_workout(seance))["workoutId"]
+    resultat: dict[str, Any] = {
+        "id_seance": id_seance,
+        "nom": nom,
+        "publiee": True,
+        "duree_estimee_min": round(seance["estimatedDurationInSecs"] / 60),
+        "url": f"https://connect.garmin.com/modern/workout/{id_seance}",
+    }
+    if date_prevue is None:
+        resultat["suite"] = "Séance dans la bibliothèque, sans date : envoie-la vers la montre depuis Garmin Connect."
+        return resultat
+    try:
+        _publier(lambda: garmin.schedule_workout(id_seance, date_prevue))
+    except ToolError as erreur:
+        resultat["erreur_planification"] = f"Séance créée mais non planifiée : {erreur}"
+    else:
+        resultat["planifiee_le"] = date_prevue
+        resultat["suite"] = "Synchronise la montre : la séance apparaît à cette date."
+    return resultat
+
+
+@mcp.tool()
+def lister_seances(ctx: Context, limite: Annotated[int, Field(ge=1, le=100)] = 20) -> list[dict[str, Any]]:
+    """Liste les dernières séances de la bibliothèque Garmin Connect. Demande le jeton de publication."""
+    garmin = _garmin_publication(ctx)
+    return [
+        {
+            "id_seance": s.get("workoutId"),
+            "nom": s.get("workoutName"),
+            "sport": (s.get("sportType") or {}).get("sportTypeKey"),
+            "creee_le": s.get("createdDate"),
+        }
+        for s in _publier(lambda: garmin.get_workouts(0, limite)) or []
+    ]
+
+
+@mcp.tool()
+def supprimer_seance(ctx: Context, id_seance: Annotated[int, Field(gt=0)]) -> dict[str, Any]:
+    """Supprime définitivement une séance de la bibliothèque Garmin Connect et du calendrier.
+
+    Demande le jeton de publication.
+    """
+    garmin = _garmin_publication(ctx)
+    _publier(lambda: garmin.delete_workout(id_seance))
+    return {"supprimee": id_seance}
+
+
 class PointParcours(BaseModel):
     latitude: float = Field(ge=-90, le=90, allow_inf_nan=False)
     longitude: float = Field(ge=-180, le=180, allow_inf_nan=False)
@@ -251,6 +389,9 @@ app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
 
 @app.middleware("http")
 async def proteger_mcp(request: Request, call_next):
+    if request.url.path == "/connexion":
+        return await call_next(request)
+
     en_tetes = request.headers.getlist("authorization")
     autorisation = AUTHORIZATION.fullmatch(en_tetes[0]) if len(en_tetes) == 1 else None
     if autorisation is None:
@@ -260,10 +401,176 @@ async def proteger_mcp(request: Request, call_next):
             status_code=401,
         )
 
+    publication = request.headers.getlist(EN_TETE_PUBLICATION)
+    if publication:
+        jeton = JETON_PUBLICATION.fullmatch(publication[0].strip()) if len(publication) == 1 else None
+        if jeton is None:
+            return JSONResponse(
+                {"error": f"En-tête {EN_TETE_PUBLICATION} illisible : recopie le jeton donné par /connexion"},
+                headers={"Cache-Control": "no-store"},
+                status_code=401,
+            )
+        request.state.jeton_publication = (jeton.group(1), jeton.group(2))
+
     request.state.cle_garmin = autorisation.group(1)
     response = await call_next(request)
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+# ---------------------------------------------------------------- page de connexion
+
+TAILLE_MAX_FORMULAIRE = 64 * 1024
+
+STYLE = """
+:root{color-scheme:light dark;--fond:#f6f7f9;--carte:#fff;--texte:#16181d;--doux:#5b6270;--trait:#d5d9e0;--accent:#0b6bcb;--alerte:#b3261e}
+@media (prefers-color-scheme:dark){:root{--fond:#111318;--carte:#1b1e25;--texte:#eceef2;--doux:#a3abb8;--trait:#343945;--accent:#6cb0ff;--alerte:#ff8a80}}
+*{box-sizing:border-box}
+body{margin:0;padding:24px 16px;background:var(--fond);color:var(--texte);font:16px/1.5 system-ui,sans-serif}
+main{max-width:460px;margin:0 auto;background:var(--carte);border:1px solid var(--trait);border-radius:12px;padding:24px}
+h1{font-size:1.35rem;margin:0 0 8px}
+p,li{color:var(--doux);margin:0 0 12px}
+ol{padding-left:20px;margin:0 0 12px}
+label{display:block;font-weight:600;margin:16px 0 6px}
+input,textarea,button{width:100%;font:inherit;border-radius:8px}
+input,textarea{padding:12px;border:1px solid var(--trait);background:var(--fond);color:var(--texte)}
+textarea{height:132px;resize:none;word-break:break-all;font-family:ui-monospace,monospace;font-size:.85rem}
+button{margin-top:20px;padding:13px;border:0;background:var(--accent);color:var(--carte);font-weight:600}
+.alerte{color:var(--alerte);font-weight:600}
+code{font-family:ui-monospace,monospace;color:var(--texte)}
+"""
+
+
+def _page(corps: str, statut: int = 200, script: str = "") -> HTMLResponse:
+    nonce = secrets.token_urlsafe(16)
+    document = (
+        '<!doctype html><html lang="fr"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<meta name="robots" content="noindex,nofollow"><title>Connexion Garmin</title>'
+        f"<style>{STYLE}</style></head><body><main>{corps}</main>"
+        + (f'<script nonce="{nonce}">{script}</script>' if script else "")
+        + "</body></html>"
+    )
+    return HTMLResponse(
+        document,
+        status_code=statut,
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": (
+                "default-src 'none'; style-src 'unsafe-inline'; "
+                f"script-src 'nonce-{nonce}'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+            ),
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+        },
+    )
+
+
+def _page_identifiants(erreur: str = "", statut: int = 200) -> HTMLResponse:
+    alerte = f'<p class="alerte">{html.escape(erreur)}</p>' if erreur else ""
+    return _page(
+        "<h1>Connexion Garmin</h1>"
+        "<p>Connecte-toi pour obtenir ton jeton de publication. Ton e-mail et ton mot de passe "
+        "sont transmis à Garmin et ne sont ni enregistrés ni journalisés par ce site.</p>"
+        f'{alerte}<form method="post" action="/connexion" autocomplete="on">'
+        '<label for="email">E-mail Garmin</label>'
+        '<input id="email" name="email" type="email" autocomplete="username" required>'
+        '<label for="mot_de_passe">Mot de passe</label>'
+        '<input id="mot_de_passe" name="mot_de_passe" type="password" autocomplete="current-password" required>'
+        "<button>Se connecter</button></form>",
+        statut,
+    )
+
+
+def _page_code(etat: str, erreur: str = "", statut: int = 200) -> HTMLResponse:
+    alerte = f'<p class="alerte">{html.escape(erreur)}</p>' if erreur else ""
+    return _page(
+        "<h1>Code de vérification</h1>"
+        "<p>Garmin t'a envoyé un code. Saisis-le pour terminer la connexion.</p>"
+        f'{alerte}<form method="post" action="/connexion" autocomplete="off">'
+        f'<input type="hidden" name="etat" value="{html.escape(etat, quote=True)}">'
+        '<label for="code">Code</label>'
+        '<input id="code" name="code" inputmode="numeric" autocomplete="one-time-code" required>'
+        "<button>Valider</button></form>",
+        statut,
+    )
+
+
+def _page_jeton(jeton: str) -> HTMLResponse:
+    return _page(
+        "<h1>Jeton de publication</h1>"
+        "<p>Ce jeton donne accès à ton compte Garmin : traite-le comme un mot de passe. "
+        "Il n'est affiché qu'ici et ce site n'en garde aucune copie.</p>"
+        f'<label for="jeton">Valeur de l\'en-tête <code>{EN_TETE_PUBLICATION}</code></label>'
+        f'<textarea id="jeton" readonly>{html.escape(jeton)}</textarea>'
+        '<button type="button" id="copier">Copier le jeton</button>'
+        "<p></p><ol>"
+        "<li>Dans Claude, supprime le connecteur Garmin : ses en-têtes ne se modifient pas après coup.</li>"
+        "<li>Ajoute-le de nouveau avec la même adresse et l'en-tête <code>Authorization</code> habituel.</li>"
+        f"<li>Ajoute un second en-tête <code>{EN_TETE_PUBLICATION}</code> et colle ce jeton comme valeur.</li>"
+        "</ol><p>Si Garmin refuse un jour le jeton, reviens sur cette page pour en obtenir un nouveau.</p>",
+        script=(
+            "const b=document.getElementById('copier'),j=document.getElementById('jeton');"
+            "b.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(j.value)}"
+            "catch(e){j.select();document.execCommand('copy')}b.textContent='Jeton copié'});"
+        ),
+    )
+
+
+def _connexion_garmin(champs: dict[str, str]) -> tuple[str, str]:
+    """Renvoie ("jeton", valeur) ou ("code", état à renvoyer avec le code de vérification)."""
+    from garminconnect import Garmin
+
+    if champs.get("etat"):
+        garmin = Garmin(return_on_mfa=True)
+        etat = json.loads(base64.urlsafe_b64decode(champs["etat"]))
+        if not isinstance(etat, dict):
+            raise ValueError("état illisible")
+        garmin.client.resume_login(etat, champs.get("code", "").strip())
+    else:
+        garmin = Garmin(champs.get("email", "").strip(), champs.get("mot_de_passe", ""), return_on_mfa=True)
+        statut, etat = garmin.login()
+        if statut == "needs_mfa":
+            return "code", base64.urlsafe_b64encode(json.dumps(etat).encode()).decode()
+    jeton = f"{garmin.client.di_client_id}:{garmin.client.di_refresh_token}"
+    if not JETON_PUBLICATION.fullmatch(jeton):
+        raise ValueError("jeton Garmin inattendu")
+    return "jeton", jeton
+
+
+@app.get("/connexion")
+def page_connexion() -> HTMLResponse:
+    return _page_identifiants()
+
+
+@app.post("/connexion")
+async def connexion(request: Request) -> HTMLResponse:
+    from garminconnect import GarminConnectAuthenticationError, GarminConnectTooManyRequestsError
+
+    corps = await request.body()
+    if len(corps) > TAILLE_MAX_FORMULAIRE:
+        return _page_identifiants("Formulaire trop volumineux.", 413)
+    try:
+        champs = {k: v[0] for k, v in parse_qs(corps.decode("utf-8"), max_num_fields=8).items()}
+    except ValueError:
+        return _page_identifiants("Formulaire illisible.", 400)
+    etat = champs.get("etat", "")
+    if not etat and not (champs.get("email") and champs.get("mot_de_passe")):
+        return _page_identifiants("Saisis ton e-mail et ton mot de passe.", 400)
+
+    def retour(message: str, statut: int) -> HTMLResponse:
+        return _page_code(etat, message, statut) if etat else _page_identifiants(message, statut)
+
+    try:
+        etape, valeur = await run_in_threadpool(_connexion_garmin, champs)
+    except GarminConnectTooManyRequestsError:
+        return retour("Garmin limite les connexions. Attends une heure avant de réessayer.", 429)
+    except GarminConnectAuthenticationError:
+        return retour("Garmin a refusé le code." if etat else "Garmin a refusé ces identifiants.", 401)
+    except Exception:
+        return retour("Garmin est indisponible ou a bloqué la connexion depuis ce site. Réessaie plus tard.", 502)
+    return _page_code(valeur) if etape == "code" else _page_jeton(valeur)
 
 
 app.mount("/", mcp_app)

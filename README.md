@@ -49,7 +49,20 @@ Chaque personne ajoute le connecteur distant dans son propre compte Claude avec 
 
 Claude conserve la clé personnelle dans la configuration du connecteur. À chaque lecture, le serveur échange la clé contre un jeton Garmin et utilise ce jeton pour la requête. Le serveur ne conserve ni la clé ni le jeton et aucune variable Garmin n'est à renseigner sur Vercel. L'accès fonctionne entre les conversations et les redémarrages du serveur jusqu'à l'expiration ou la révocation de la clé. Dans ce cas, crée une nouvelle clé dans Garmin Connect Web et renseigne-la dans Claude. [Durée et révocation des clés](https://developer.garmin.com/gc-developer-program/personal/personal-faq/)
 
-Pour héberger ta propre instance, déploie `app.py` et `requirements.txt` avec le préréglage FastAPI sur Vercel. Vérifie que `/mcp` refuse une requête sans clé avec le statut HTTP 401.
+Pour héberger ta propre instance, déploie `app.py`, `server.py` et `requirements.txt` avec le préréglage FastAPI sur Vercel. Vérifie que `/mcp` refuse une requête sans clé avec le statut HTTP 401.
+
+### Publier des séances depuis le téléphone
+
+La clé personnelle ne permet que la lecture. Pour publier, chaque personne ajoute à son connecteur un jeton de publication obtenu sur la page de connexion du site. Tout se fait depuis le téléphone.
+
+1. Ouvre `https://mcp-garmin-claude.vercel.app/connexion` et connecte-toi avec ton e-mail et ton mot de passe Garmin, puis le code de vérification s'il est demandé.
+2. Copie le jeton affiché. Il donne accès à ton compte Garmin : traite-le comme un mot de passe.
+3. Dans Claude, supprime le connecteur Garmin puis ajoute-le de nouveau, car les en-têtes ne se modifient pas après coup. Remets l'en-tête `Authorization` habituel et ajoute un second en-tête `X-Auth-Token` avec le jeton comme valeur.
+4. Demande par exemple : « Crée sur Garmin pour mardi 6 x 1000 m à 4:55-5:05, 15 min d'échauffement en zone 2, 2 min de récup, 10 min de retour au calme. »
+
+Le site transmet l'e-mail et le mot de passe à Garmin sans les enregistrer ni les journaliser, et ne garde aucune copie du jeton. À chaque publication, le serveur échange le jeton contre un accès temporaire à Garmin. Si Garmin refuse un jour le jeton, refais ces étapes pour en obtenir un nouveau.
+
+La publication passe par la bibliothèque non officielle `garminconnect`, comme le serveur local. Garmin peut la bloquer ou changer son site sans préavis.
 
 ### Outils du connecteur distant
 
@@ -59,10 +72,13 @@ Pour héberger ta propre instance, déploie `app.py` et `requirements.txt` avec 
 | `historique_activites` | Activités filtrables par sport et date, avec distance, durée, dénivelé, fréquence cardiaque et puissance quand Garmin les fournit. |
 | `detail_activite` | Mesures détaillées à partir de l'identifiant fourni par l'historique. |
 | `indicateurs_entrainement` | Sommeil, VFC, Body Battery, VO₂ max, résumé quotidien ou zones de fréquence cardiaque. |
-| `preparer_seance` | Valide une séance de course, vélo ou natation avec étapes, répétitions et cibles. Le résultat sert à recréer la séance dans Garmin Connect. |
+| `preparer_seance` | Valide une séance de course, vélo ou natation avec étapes, répétitions et cibles, sans la publier. |
+| `creer_seance` | Publie la séance dans Garmin Connect et, avec une date, la met au calendrier. Demande le jeton de publication. |
+| `lister_seances` | Liste les séances de la bibliothèque. Demande le jeton de publication. |
+| `supprimer_seance` | Supprime une séance. Demande le jeton de publication. |
 | `exporter_parcours_gpx` | Produit le contenu d'un fichier GPX à partir des points ordonnés d'un tracé. Enregistre ce contenu dans un fichier `.gpx`, puis importe-le dans Garmin Connect. |
 
-La clé personnelle permet la lecture. La publication directe vers Garmin Connect demande un accès autorisé aux API Business [Training](https://developer.garmin.com/gc-developer-program/enterprise/training-api/) et [Courses](https://developer.garmin.com/gc-developer-program/enterprise/courses-api/). Garmin décrit l'[import manuel d'un GPX](https://support.garmin.com/en-GB/?faq=wKuZXCaZRP4mWPX5aRz5h5) sur le web et sur mobile.
+La clé personnelle permet la lecture et le jeton de publication permet de créer des séances. La publication d'un parcours GPX, elle, demande un accès autorisé aux API Business [Training](https://developer.garmin.com/gc-developer-program/enterprise/training-api/) et [Courses](https://developer.garmin.com/gc-developer-program/enterprise/courses-api/). Garmin décrit l'[import manuel d'un GPX](https://support.garmin.com/en-GB/?faq=wKuZXCaZRP4mWPX5aRz5h5) sur le web et sur mobile.
 
 ## Utilisation du serveur local
 
