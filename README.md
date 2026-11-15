@@ -40,7 +40,7 @@ claude mcp add garmin -- python C:\Users\<toi>\garmin-mcp\server.py
 
 ## Utiliser Garmin dans Claude sur le web et sur mobile
 
-Le connecteur distant lit la date, le sport et la distance de la dernière activité. Chaque personne ajoute le connecteur dans son propre compte Claude avec sa propre clé API personnelle Garmin. La même adresse sert à tous.
+Chaque personne ajoute le connecteur distant dans son propre compte Claude avec sa propre clé API personnelle Garmin. La même adresse sert à tous.
 
 1. Connecte-toi à Garmin Connect Web et termine la double authentification sur Garmin si elle est demandée. Crée ensuite ta clé API personnelle et choisis sa durée de validité. [Procédure Garmin](https://developer.garmin.com/gc-developer-program/personal/personal-api/)
 2. Sur [claude.ai](https://claude.ai), ouvre **Personnaliser → Connecteurs → Ajouter → Personnalisé → Web**. Nomme le connecteur **Garmin** et saisis `https://mcp-garmin-claude.vercel.app/mcp`.
@@ -51,7 +51,20 @@ Claude conserve la clé personnelle dans la configuration du connecteur. À chaq
 
 Pour héberger ta propre instance, déploie `app.py` et `requirements.txt` avec le préréglage FastAPI sur Vercel. Vérifie que `/mcp` refuse une requête sans clé avec le statut HTTP 401.
 
-## Utilisation
+### Outils du connecteur distant
+
+| Outil | Utilisation |
+|---|---|
+| `derniere_activite` | Date locale, sport et distance de la dernière activité. |
+| `historique_activites` | Activités filtrables par sport et date, avec distance, durée, dénivelé, fréquence cardiaque et puissance quand Garmin les fournit. |
+| `detail_activite` | Mesures détaillées à partir de l'identifiant fourni par l'historique. |
+| `indicateurs_entrainement` | Sommeil, VFC, Body Battery, VO₂ max, résumé quotidien ou zones de fréquence cardiaque. |
+| `preparer_seance` | Valide une séance de course, vélo ou natation avec étapes, répétitions et cibles. Le résultat sert à recréer la séance dans Garmin Connect. |
+| `exporter_parcours_gpx` | Produit le contenu d'un fichier GPX à partir des points ordonnés d'un tracé. Enregistre ce contenu dans un fichier `.gpx`, puis importe-le dans Garmin Connect. |
+
+La clé personnelle permet la lecture. La publication directe vers Garmin Connect demande un accès autorisé aux API Business [Training](https://developer.garmin.com/gc-developer-program/enterprise/training-api/) et [Courses](https://developer.garmin.com/gc-developer-program/enterprise/courses-api/). Garmin décrit l'[import manuel d'un GPX](https://support.garmin.com/en-GB/?faq=wKuZXCaZRP4mWPX5aRz5h5) sur le web et sur mobile.
+
+## Utilisation du serveur local
 
 Demande simplement, par exemple : « Crée sur Garmin pour mardi 6 x 1000 m à 4:55-5:05, 15 min d'échauffement en zone 2, 2 min de récup, 10 min de retour au calme. »
 
