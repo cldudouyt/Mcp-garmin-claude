@@ -38,28 +38,18 @@ Puis quitte complètement Claude et relance-le.
 claude mcp add garmin -- python C:\Users\<toi>\garmin-mcp\server.py
 ```
 
-## Tester sur Android avec Claude Mobile
+## Utiliser Garmin dans Claude sur le web et sur mobile
 
-Le dépôt fournit `server.py` pour Claude Desktop et `app.py` pour un test distant sur Android. L'instance distante utilise un seul compte Garmin et expose uniquement la date, le sport et la distance de sa dernière activité.
+Le connecteur distant lit la date, le sport et la distance de la dernière activité. Chaque personne ajoute le connecteur dans son propre compte Claude avec sa propre clé API personnelle Garmin. La même adresse sert à tous.
 
-### 1. Configurer l'instance de test sur Vercel
+1. Connecte-toi à Garmin Connect Web et termine la double authentification sur Garmin si elle est demandée. Crée ensuite ta clé API personnelle et choisis sa durée de validité. [Procédure Garmin](https://developer.garmin.com/gc-developer-program/personal/personal-api/)
+2. Sur [claude.ai](https://claude.ai), ouvre **Personnaliser → Connecteurs → Ajouter → Personnalisé → Web**. Nomme le connecteur **Garmin** et saisis `https://mcp-garmin-claude.vercel.app/mcp`.
+3. Choisis **Pas de connexion** pour l'option OAuth. Dans **En-têtes de requête**, sélectionne `Authorization` et mets `ApiKey TA_CLÉ_GARMIN` comme valeur, avec un espace après `ApiKey`. Marque l'en-tête comme obligatoire. Claude déploie cette fonction progressivement. [Configuration des en-têtes dans Claude](https://claude.com/docs/connectors/custom/add-unlisted#authenticate-with-request-headers)
+4. Dans une conversation Claude sur le web, sur iOS ou sur Android, active **Garmin** et demande « Donne-moi la date, le sport et la distance de ma dernière activité Garmin. » Compare le résultat avec Garmin Connect.
 
-1. Sur ton ordinateur, installe les versions de `requirements.txt` avec `python -m pip install -r requirements.txt`. Pour créer une session Garmin dédiée, choisis un dossier de jetons distinct de celui de Claude Desktop. Dans PowerShell, exécute `$env:GARMINTOKENS = "$env:USERPROFILE\.garminconnect-android"`, puis `python server.py login`.
-2. Dans le projet Vercel dédié, ajoute deux variables d'environnement sensibles. Pour `MCP_ACCESS_KEY`, génère une clé avec `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Pour `GARMIN_TOKENS_JSON`, colle le contenu du fichier `garmin_tokens.json` produit dans le dossier dédié. Saisis ces valeurs directement dans Vercel et garde le fichier hors du dépôt.
-3. Déploie le projet avec le préréglage FastAPI. Pour ce projet dédié, utilise une URL joignable par les serveurs d'Anthropic. Ajoute `/mcp` à cette URL et vérifie qu'une requête directe sans clé répond `401`. [FastAPI sur Vercel](https://vercel.com/docs/frameworks/backend/fastapi)
+Claude conserve la clé personnelle dans la configuration du connecteur. À chaque lecture, le serveur échange la clé contre un jeton Garmin et utilise ce jeton pour la requête. Le serveur ne conserve ni la clé ni le jeton et aucune variable Garmin n'est à renseigner sur Vercel. L'accès fonctionne entre les conversations et les redémarrages du serveur jusqu'à l'expiration ou la révocation de la clé. Dans ce cas, crée une nouvelle clé dans Garmin Connect Web et renseigne-la dans Claude. [Durée et révocation des clés](https://developer.garmin.com/gc-developer-program/personal/personal-faq/)
 
-### 2. Ajouter le connecteur dans Claude
-
-1. Sur [claude.ai](https://claude.ai), ouvre **Personnaliser → Connecteurs → Ajouter** et choisis un connecteur personnalisé web. Donne-lui un nom, par exemple `Garmin (test Android)`, et saisis l'URL HTTPS complète, chemin `/mcp` compris.
-2. Choisis le mode sans connexion OAuth et ajoute, dans **En-têtes de requête**, `X-MCP-Key` avec la valeur de `MCP_ACCESS_KEY`. Termine l'ajout du connecteur. [Configuration des connecteurs personnalisés](https://support.claude.com/fr/articles/11175166-commencer-avec-les-connecteurs-personnalises-utilisant-mcp-distant)
-
-### 3. Vérifier le résultat sur Android
-
-1. Dans l'application Claude, connecte-toi avec le même compte que sur claude.ai. Ouvre une nouvelle conversation et active **Garmin (test Android)** dans le menu des connecteurs. [Utiliser les connecteurs sur Claude Mobile](https://support.claude.com/fr/articles/11176164-utiliser-les-connecteurs-pour-etendre-les-capacites-de-claude)
-2. Demande « Donne-moi la date, le sport et la distance de ma dernière activité Garmin. » Vérifie que Claude utilise le connecteur et compare les trois valeurs avec ton activité dans Garmin Connect.
-3. En cas d'erreur d'accès, vérifie l'URL HTTPS, le chemin `/mcp` et l'en-tête `X-MCP-Key`. Si la session Garmin expire, relance `python server.py login` dans le dossier dédié, remplace `GARMIN_TOKENS_JSON` et redéploie. Les jetons renouvelés à l'exécution restent en mémoire tant que l'instance Vercel tourne.
-
-Cette instance utilise une seule session Garmin. Pour ouvrir le connecteur au club, il faut identifier chaque adhérent et utiliser ses propres jetons Garmin.
+Pour héberger ta propre instance, déploie `app.py` et `requirements.txt` avec le préréglage FastAPI sur Vercel. Vérifie que `/mcp` refuse une requête sans clé avec le statut HTTP 401.
 
 ## Utilisation
 
